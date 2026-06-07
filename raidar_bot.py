@@ -123,8 +123,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 `/profile` `/connect <wallet>` `/login` `/logout`
 """, parse_mode=ParseMode.MARKDOWN)
 
-# ── RAID ──────────────────────────────────────────────
-
 async def raid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admins only.")
@@ -132,14 +130,12 @@ async def raid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/raid <tweet_link>`", parse_mode=ParseMode.MARKDOWN)
         return
-
     link = context.args[0]
     conn = get_db()
     conn.execute("UPDATE active_raid SET is_active = 0")
     conn.execute("INSERT INTO active_raid (tweet_link, is_active) VALUES (?, 1)", (link,))
     conn.commit()
     conn.close()
-
     await update.message.reply_text(
         f"🔥 **RAID STARTED!**\n\n🐦 {link}\n\nLike, RT & comment! Earn XP for participating.",
         parse_mode=ParseMode.MARKDOWN
@@ -155,8 +151,6 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("🛑 Raid stopped.")
 
-# ── QUEUE ─────────────────────────────────────────────
-
 async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admins only.")
@@ -164,10 +158,8 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/next <link> [targets]`", parse_mode=ParseMode.MARKDOWN)
         return
-
     link = context.args[0]
     targets = " ".join(context.args[1:]) if len(context.args) > 1 else None
-
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM raid_queue")
@@ -177,11 +169,9 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (link, targets, count + 1, update.effective_user.id)
     )
     conn.commit()
-
     c.execute("SELECT id, tweet_link, targets, position FROM raid_queue ORDER BY position")
     rows = c.fetchall()
     conn.close()
-
     queue_text = "\n".join([f"{i+1}. {r[1]}{' — ' + r[2] if r[2] else ''}" for i, r in enumerate(rows)])
     await update.message.reply_text(f"➕ Added to queue!\n\n**Queue:**\n{queue_text}", parse_mode=ParseMode.MARKDOWN)
 
@@ -197,7 +187,6 @@ async def delnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Index must be a number.")
         return
-
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id FROM raid_queue ORDER BY position LIMIT 1 OFFSET ?", (idx - 1,))
@@ -218,10 +207,8 @@ async def setnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/setnext <link> [targets]`", parse_mode=ParseMode.MARKDOWN)
         return
-
     link = context.args[0]
     targets = " ".join(context.args[1:]) if len(context.args) > 1 else None
-
     conn = get_db()
     conn.execute("DELETE FROM raid_queue")
     conn.execute(
@@ -244,7 +231,6 @@ async def switchnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Indices must be numbers.")
         return
-
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, position FROM raid_queue ORDER BY position")
@@ -271,59 +257,42 @@ async def clearnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("🧹 Queue cleared.")
 
-# ── XP & LEADERBOARD ──────────────────────────────────
-
 async def lb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = context.args[0].upper() if context.args else "ALL"
     conn = get_db()
     c = conn.cursor()
-
     if period == "1D":
-        since = (datetime.utcnow() - timedelta(days=1)).isoformat()
         label = "Last 24h"
     elif period == "7D":
-        since = (datetime.utcnow() - timedelta(days=7)).isoformat()
         label = "Last 7 Days"
     elif period == "30D":
-        since = (datetime.utcnow() - timedelta(days=30)).isoformat()
         label = "Last 30 Days"
     else:
-        since = None
         label = "All Time"
-
     c.execute(
         "SELECT telegram_id, twitter_username, xp FROM users WHERE disqualified = 0 ORDER BY xp DESC LIMIT 10"
     )
     rows = c.fetchall()
     conn.close()
-
     if not rows:
         await update.message.reply_text("📊 No data yet.")
         return
-
     medals = ["🥇", "🥈", "🥉"]
     lines = [f"🏆 **Leaderboard — {label}**\n"]
     for i, (tg_id, tw, xp) in enumerate(rows):
         prefix = medals[i] if i < 3 else f"{i+1}."
         name = f"@{tw}" if tw else f"#{tg_id}"
         lines.append(f"{prefix} {name} — `{xp} XP`")
-
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def xp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        identifier = context.args[0]
-    else:
-        identifier = str(update.effective_user.id)
-
+    identifier = context.args[0] if context.args else str(update.effective_user.id)
     conn = get_db()
     row = get_user_by_identifier(conn, identifier)
     conn.close()
-
     if not row:
         await update.message.reply_text("❌ User not found.")
         return
-
     tg_id, tw, wallet, xp, disq, is_pro, joined = row
     name = f"@{tw}" if tw else f"#{tg_id}"
     status = "⛔ Disqualified" if disq else ("⭐ Pro" if is_pro else "✅ Active")
@@ -344,7 +313,6 @@ async def givexp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Amount must be a number.")
         return
-
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
@@ -368,7 +336,6 @@ async def remxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Amount must be a number.")
         return
-
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
@@ -443,8 +410,6 @@ async def lbreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("🔄 Leaderboard reset. All XP cleared.")
 
-# ── REWARDS / SETTINGS ────────────────────────────────
-
 async def reward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Admins only.")
@@ -480,8 +445,6 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ── USER PROFILE ──────────────────────────────────────
-
 async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     conn = get_db()
@@ -492,11 +455,12 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = c.fetchone()
     conn.close()
     tg_id, tw, wallet, xp, disq, is_pro, joined = row
+    wallet_display = f"`{wallet[:6]}...{wallet[-4:]}`" if wallet else "—"
     lines = [
-        f"👤 **Profile**",
+        "👤 **Profile**",
         f"🆔 Telegram: `{tg_id}`",
         f"🐦 Twitter: {'@' + tw if tw else '—'}",
-        f"💼 Wallet: `{wallet[:6]}...{wallet[-4:]}` " if wallet else "💼 Wallet: —",
+        f"💼 Wallet: {wallet_display}",
         f"💎 XP: `{xp}`",
         f"⭐ Pro: {'Yes' if is_pro else 'No'}",
         f"⛔ Disqualified: {'Yes' if disq else 'No'}",
@@ -534,8 +498,6 @@ async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("👋 Twitter account unlinked.")
 
-# ── GROUP / PRO ───────────────────────────────────────
-
 async def gxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     c = conn.cursor()
@@ -549,8 +511,7 @@ async def gxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def trend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📈 **Trend Boost**\n\nBoost your group's visibility by raiding consistently!\n\n"
-        "Keep raiding to climb the ranks. 🚀",
+        "📈 **Trend Boost**\n\nBoost your group's visibility by raiding consistently!\n\nKeep raiding to climb the ranks. 🚀",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -561,8 +522,6 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
-
-# ── CALLBACK HANDLER ──────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -605,8 +564,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Contact an admin to upgrade to Pro!", show_alert=True)
 
 # ====================== MAIN ======================
+# PTB manages its own event loop — do NOT use asyncio.run() or async def main()
 
-async def main():
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -639,7 +599,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(button_handler))
 
     logger.info("🚀 Raidar Bot is running!")
-    await app.run_polling()
+    app.run_polling()  # PTB owns the event loop — do NOT await this
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()  # plain call, NOT asyncio.run()
