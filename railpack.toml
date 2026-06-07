@@ -1,9 +1,9 @@
 [build]
 builder = "python"
 python.version = "3.11"
-install = ["python-telegram-bot==21.9", "python-dotenv"]
+install = ["python-telegram-bot==21.9", "python-dotenv", "flask", "requests"]
 
 [deploy]
-startCommand = "./start.sh"
+startCommand = "python raidar_bot.py"
 runtime = "python"
-env = ["BOT_TOKEN"]
+env = ["BOT_TOKEN", "TWITTER_CLIENT_ID", "TWITTER_CLIENT_SECRET", "CALLBACK_URL", "FLASK_SECRET"]
