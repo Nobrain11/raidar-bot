@@ -1,0 +1,9 @@
+[build]
+builder = "python"
+python.version = "3.12"
+
+[deploy]
+startCommand = "python raidar_bot.py"
+runtime = "python"
+
+env = ["BOT_TOKEN"]
