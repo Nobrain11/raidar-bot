@@ -13,7 +13,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
 
-from flask import Flask, request, redirect, session
+from flask import Flask, request, redirect
 import requests as http_requests
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -24,7 +24,7 @@ ADMIN_IDS = [7761011341]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TWITTER_CLIENT_ID = os.getenv("TWITTER_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_CLIENT_SECRET")
-CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:5000/callback")
+CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:5000/callback").strip()
 FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_hex(32))
 PORT = int(os.getenv("PORT", 5000))
 
@@ -240,7 +240,8 @@ def oauth_callback():
     """
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    from waitress import serve
+    serve(flask_app, host="0.0.0.0", port=PORT)
 
 # ====================== BOT COMMANDS ======================
 
@@ -315,7 +316,6 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: {status}"
     )
 
-    # Build buttons
     buttons = []
     if not tw_user:
         oauth_url = f"{CALLBACK_URL.rsplit('/callback', 1)[0]}/connect/{tg_id}"
@@ -692,7 +692,6 @@ async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ── WALLET CONNECT FLOW ───────────────────────────────
-# Tracks users awaiting wallet input
 _awaiting_wallet = set()
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -747,7 +746,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in _awaiting_wallet:
         _awaiting_wallet.discard(user_id)
         wallet = update.message.text.strip()
-        # Basic Solana address validation (32-44 base58 chars)
         if len(wallet) < 32 or len(wallet) > 44 or ' ' in wallet:
             await update.message.reply_text("❌ That doesn't look like a valid Solana address. Try again with `/connect <address>`.", parse_mode=ParseMode.MARKDOWN)
             return
@@ -760,6 +758,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Wallet saved!\n`{wallet[:6]}...{wallet[-4:]}`\n\nUse /profile to view your profile.",
             parse_mode=ParseMode.MARKDOWN
         )
+
+# ====================== ERROR HANDLER ======================
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception while handling an update: {context.error}")
+    if update:
+        logger.error(f"Update: {update}")
 
 # ====================== MAIN ======================
 
@@ -803,6 +808,7 @@ def main():
     app.add_handler(CommandHandler("pro", pro_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(error_handler)
 
     logger.info("🚀 Raidar Bot is running!")
     app.run_polling()
