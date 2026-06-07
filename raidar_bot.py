@@ -110,12 +110,15 @@ def build_twitter_oauth_url(state, code_challenge):
         "response_type": "code",
         "client_id": TWITTER_CLIENT_ID,
         "redirect_uri": CALLBACK_URL,
-        "scope": "tweet.read users.read offline.access",
+        "scope": "tweet.read tweet.write users.read offline.access",
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        "prompt": "login",
     }
-    return "https://twitter.com/i/oauth2/authorize?" + urllib.parse.urlencode(params)
+    url = "https://twitter.com/i/oauth2/authorize?" + urllib.parse.urlencode(params)
+    logger.info(f"OAuth URL: {url}")
+    return url
 
 def exchange_code_for_token(code, code_verifier):
     resp = http_requests.post(
