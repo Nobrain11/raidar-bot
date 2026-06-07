@@ -1,6 +1,7 @@
 [build]
 builder = "python"
 python.version = "3.11"
+python.packages = ["python-telegram-bot==20.8", "python-dotenv"]
 
 [deploy]
 startCommand = "python raidar_bot.py"
