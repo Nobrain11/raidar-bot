@@ -1,6 +1,6 @@
 [build]
 builder = "python"
-python.version = "3.12"
+python.version = "3.11"
 
 [deploy]
 startCommand = "python raidar_bot.py"
