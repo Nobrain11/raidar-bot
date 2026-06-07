@@ -688,28 +688,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id):
             await query.answer("Admins only.", show_alert=True)
             return
+
         pending = context.bot_data.get(f"pending_raid_{chat_id}", {})
         link = pending.get("link", "")
+        if not link:
+            await query.answer("No raid link set. Use /raid <link> first.", show_alert=True)
+            return
+
         tl = pending.get("target_likes", 10)
         tr = pending.get("target_retweets", 5)
         trep = pending.get("target_replies", 3)
+
         conn = get_db()
         conn.execute("UPDATE active_raid SET is_active = 0")
-        conn.execute("INSERT INTO active_raid (tweet_link, target_likes, target_retweets, target_replies, is_active) VALUES (?, ?, ?, ?, 1)", (link, tl, tr, trep))
+        conn.execute("INSERT INTO active_raid (tweet_link, target_likes, target_retweets, target_replies, is_active) VALUES (?, ?, ?, ?, 1)", 
+                     (link, tl, tr, trep))
         conn.commit()
         c = conn.cursor()
         c.execute("SELECT id FROM active_raid WHERE is_active = 1 ORDER BY id DESC LIMIT 1")
         raid_id_row = c.fetchone()
         raid_db_id = raid_id_row[0] if raid_id_row else None
         conn.close()
+
         text = build_raid_live_text(link, tl, tr, trep)
-        msg = await query.message.reply_text(text, reply_markup=build_raid_live_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        try:
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=build_raid_live_keyboard(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Failed to send live raid message: {e}")
+            await query.answer("Failed to start raid. Check logs.", show_alert=True)
+            return
+
         if raid_db_id:
             conn = get_db()
-            conn.execute("UPDATE active_raid SET live_message_id = ?, live_chat_id = ? WHERE id = ?", (msg.message_id, chat_id, raid_db_id))
+            conn.execute("UPDATE active_raid SET live_message_id = ?, live_chat_id = ? WHERE id = ?", 
+                         (msg.message_id, chat_id, raid_db_id))
             conn.commit()
             conn.close()
-        await query.edit_message_reply_markup(reply_markup=None)
+
+        try:
+            await query.edit_message_text("\u26a1 Raid started! Live progress below.")
+        except Exception as e:
+            logger.error(f"Could not edit options panel: {e}")
+            try:
+                await query.message.delete()
+            except:
+                pass
 
     elif data == "raid_targets":
         if not is_admin(user_id):
