@@ -26,7 +26,7 @@ TWITTER_CLIENT_ID = os.getenv("TWITTER_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_CLIENT_SECRET")
 CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:5000/callback").strip()
 FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_hex(32))
-PORT = int(os.getenv("PORT", 5000))
+PORT = int(os.getenv("PORT", 8080))
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable is required!")
@@ -145,8 +145,9 @@ def get_twitter_user(access_token):
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
-# Global bot reference
+# Global bot reference and event loop
 _bot_app = None
+_bot_loop = None
 
 @flask_app.route("/health")
 def health():
@@ -221,15 +222,19 @@ def oauth_callback():
     conn.commit()
     conn.close()
 
-    # Notify user in Telegram
-    if _bot_app:
+    # Notify user in Telegram using the bot's event loop
+    if _bot_app and _bot_loop:
         async def notify():
-            await _bot_app.bot.send_message(
-                chat_id=telegram_id,
-                text=f"✅ Twitter connected!\n\n🐦 @{twitter_username}\n\nYou're all set to raid!",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        asyncio.run_coroutine_threadsafe(notify(), asyncio.get_event_loop())
+            try:
+                await _bot_app.bot.send_message(
+                    chat_id=telegram_id,
+                    text=f"✅ Twitter connected!\n\n🐦 @{twitter_username}\n\nYou're all set to raid!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify user {telegram_id}: {e}")
+
+        asyncio.run_coroutine_threadsafe(notify(), _bot_loop)
 
     return f"""
     <html><body style="font-family:monospace;background:#0d0d0d;color:#00ff88;text-align:center;padding-top:80px;">
@@ -239,17 +244,9 @@ def oauth_callback():
     </body></html>
     """
 
-@flask_app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    if request.headers.get("content-type") == "application/json":
-        json_string = request.get_data().decode("utf-8")
-        update = Update.de_json(json_string, _bot_app.bot)
-        asyncio.run(_bot_app.process_update(update))
-        return "OK", 200
-    return "Forbidden", 403
-
 def run_flask():
     from waitress import serve
+    logger.info(f"🌐 OAuth server running on port {PORT}")
     serve(flask_app, host="0.0.0.0", port=PORT)
 
 # ====================== BOT COMMANDS ======================
@@ -325,12 +322,13 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: {status}"
     )
 
+    # Build connect URL from base of CALLBACK_URL
+    base_url = CALLBACK_URL.rsplit('/callback', 1)[0]
     buttons = []
     if not tw_user:
-        oauth_url = f"{CALLBACK_URL.rsplit('/callback', 1)[0]}/connect/{tg_id}"
-        buttons.append([InlineKeyboardButton("🐦 Connect Twitter", url=oauth_url)])
+        buttons.append([InlineKeyboardButton("🐦 Connect Twitter", url=f"{base_url}/connect/{tg_id}")])
     else:
-        buttons.append([InlineKeyboardButton("🔄 Reconnect Twitter", url=f"{CALLBACK_URL.rsplit('/callback', 1)[0]}/connect/{tg_id}")])
+        buttons.append([InlineKeyboardButton("🔄 Reconnect Twitter", url=f"{base_url}/connect/{tg_id}")])
 
     if not wallet:
         buttons.append([InlineKeyboardButton("💼 Connect Wallet", callback_data="wallet_connect")])
@@ -756,7 +754,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _awaiting_wallet.discard(user_id)
         wallet = update.message.text.strip()
         if len(wallet) < 32 or len(wallet) > 44 or ' ' in wallet:
-            await update.message.reply_text("❌ That doesn't look like a valid Solana address. Try again with `/connect <address>`.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "❌ That doesn't look like a valid Solana address. Try again with `/connect <address>`.",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
         conn = get_db()
         conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
@@ -778,7 +779,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ====================== MAIN ======================
 
 def main():
-    global _bot_app
+    global _bot_app, _bot_loop
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     _bot_app = app
@@ -814,12 +815,19 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    # Initialize bot
-    logger.info("🚀 Raidar Bot initialized!")
+    # Start Flask in a background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
-    # Run Flask (this blocks the main thread)
-    # Telegram updates come via webhook at /webhook
-    run_flask()
+    # Capture the event loop AFTER starting polling so notify() works
+    async def post_init(application):
+        global _bot_loop
+        _bot_loop = asyncio.get_event_loop()
+
+    app.post_init = post_init
+
+    logger.info("🚀 Starting Raidar Bot (polling)...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
