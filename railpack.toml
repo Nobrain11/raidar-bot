@@ -1,10 +1,9 @@
 [build]
 builder = "python"
 python.version = "3.11"
-install = ["python-telegram-bot==20.8", "python-dotenv"]
+install = ["python-telegram-bot==21.9", "python-dotenv"]
 
 [deploy]
 startCommand = "./start.sh"
 runtime = "python"
-
 env = ["BOT_TOKEN"]
