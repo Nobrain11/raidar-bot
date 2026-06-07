@@ -145,7 +145,7 @@ def get_twitter_user(access_token):
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
-# Global bot reference for sending messages from Flask
+# Global bot reference
 _bot_app = None
 
 @flask_app.route("/health")
@@ -229,7 +229,7 @@ def oauth_callback():
                 text=f"✅ Twitter connected!\n\n🐦 @{twitter_username}\n\nYou're all set to raid!",
                 parse_mode=ParseMode.MARKDOWN
             )
-        asyncio.run_coroutine_threadsafe(notify(), _bot_app.bot._request._client._loop if hasattr(_bot_app.bot._request, '_client') else asyncio.get_event_loop())
+        asyncio.run_coroutine_threadsafe(notify(), asyncio.get_event_loop())
 
     return f"""
     <html><body style="font-family:monospace;background:#0d0d0d;color:#00ff88;text-align:center;padding-top:80px;">
@@ -238,6 +238,15 @@ def oauth_callback():
     <p style="color:#555;margin-top:40px;">Return to Telegram — you're ready to raid.</p>
     </body></html>
     """
+
+@flask_app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
+        update = Update.de_json(json_string, _bot_app.bot)
+        asyncio.run(_bot_app.process_update(update))
+        return "OK", 200
+    return "Forbidden", 403
 
 def run_flask():
     from waitress import serve
@@ -771,11 +780,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     global _bot_app
 
-    # Start Flask in background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"🌐 OAuth server running on port {PORT}")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     _bot_app = app
 
@@ -810,8 +814,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 Raidar Bot is running!")
-    app.run_polling()
+    # Initialize bot
+    logger.info("🚀 Raidar Bot initialized!")
+
+    # Run Flask (this blocks the main thread)
+    # Telegram updates come via webhook at /webhook
+    run_flask()
 
 if __name__ == '__main__':
     main()
