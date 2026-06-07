@@ -2,14 +2,19 @@ import logging
 import asyncio
 import sqlite3
 import os
+import secrets
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 from telegram.constants import ParseMode
+
+from flask import Flask, request, redirect, session
+import requests as http_requests
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +22,11 @@ logger = logging.getLogger(__name__)
 # ====================== CONFIG ======================
 ADMIN_IDS = [7761011341]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TWITTER_CLIENT_ID = os.getenv("TWITTER_CLIENT_ID")
+TWITTER_CLIENT_SECRET = os.getenv("TWITTER_CLIENT_SECRET")
+CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:5000/callback")
+FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_hex(32))
+PORT = int(os.getenv("PORT", 5000))
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN environment variable is required!")
@@ -29,12 +39,19 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         telegram_id INTEGER PRIMARY KEY,
+        twitter_id TEXT,
         twitter_username TEXT,
         wallet_address TEXT,
         xp INTEGER DEFAULT 0,
         disqualified BOOLEAN DEFAULT 0,
         is_pro BOOLEAN DEFAULT 0,
         joined_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS oauth_states (
+        state TEXT PRIMARY KEY,
+        telegram_id INTEGER,
+        code_verifier TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS raid_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +62,7 @@ def init_db():
         added_at TEXT DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS active_raid (
-        id INTEGER PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         tweet_link TEXT,
         started_at TEXT DEFAULT CURRENT_TIMESTAMP,
         is_active BOOLEAN DEFAULT 1
@@ -76,7 +93,153 @@ def get_user_by_identifier(conn, identifier):
     except:
         return None
 
-# ====================== COMMANDS ======================
+# ====================== OAUTH HELPERS ======================
+import base64
+import hashlib
+import urllib.parse
+
+def generate_pkce():
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b'=').decode()
+    return code_verifier, code_challenge
+
+def build_twitter_oauth_url(state, code_challenge):
+    params = {
+        "response_type": "code",
+        "client_id": TWITTER_CLIENT_ID,
+        "redirect_uri": CALLBACK_URL,
+        "scope": "tweet.read users.read offline.access",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    return "https://twitter.com/i/oauth2/authorize?" + urllib.parse.urlencode(params)
+
+def exchange_code_for_token(code, code_verifier):
+    resp = http_requests.post(
+        "https://api.twitter.com/2/oauth2/token",
+        data={
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_id": TWITTER_CLIENT_ID,
+            "redirect_uri": CALLBACK_URL,
+            "code_verifier": code_verifier,
+        },
+        auth=(TWITTER_CLIENT_ID, TWITTER_CLIENT_SECRET),
+    )
+    return resp.json()
+
+def get_twitter_user(access_token):
+    resp = http_requests.get(
+        "https://api.twitter.com/2/users/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    return resp.json()
+
+# ====================== FLASK APP ======================
+flask_app = Flask(__name__)
+flask_app.secret_key = FLASK_SECRET
+
+# Global bot reference for sending messages from Flask
+_bot_app = None
+
+@flask_app.route("/health")
+def health():
+    return "OK", 200
+
+@flask_app.route("/connect/<int:telegram_id>")
+def connect_twitter(telegram_id):
+    if not TWITTER_CLIENT_ID:
+        return "Twitter OAuth not configured.", 500
+
+    state = secrets.token_urlsafe(32)
+    code_verifier, code_challenge = generate_pkce()
+
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO oauth_states (state, telegram_id, code_verifier) VALUES (?, ?, ?)",
+        (state, telegram_id, code_verifier)
+    )
+    conn.commit()
+    conn.close()
+
+    url = build_twitter_oauth_url(state, code_challenge)
+    return redirect(url)
+
+@flask_app.route("/callback")
+def oauth_callback():
+    code = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        return f"""
+        <html><body style="font-family:monospace;background:#0d0d0d;color:#ff4444;text-align:center;padding-top:100px;">
+        <h2>❌ Authorization denied</h2><p>{error}</p>
+        <p>Return to Telegram and try again.</p>
+        </body></html>
+        """, 400
+
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT telegram_id, code_verifier FROM oauth_states WHERE state = ?", (state,))
+    row = c.fetchone()
+
+    if not row:
+        conn.close()
+        return "<html><body>❌ Invalid or expired state. Return to Telegram.</body></html>", 400
+
+    telegram_id, code_verifier = row
+    conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    conn.commit()
+
+    token_data = exchange_code_for_token(code, code_verifier)
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        conn.close()
+        return f"<html><body>❌ Token exchange failed: {token_data}</body></html>", 500
+
+    user_data = get_twitter_user(access_token)
+    twitter_id = user_data.get("data", {}).get("id")
+    twitter_username = user_data.get("data", {}).get("username")
+
+    if not twitter_id:
+        conn.close()
+        return "<html><body>❌ Could not fetch Twitter user info.</body></html>", 500
+
+    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (telegram_id,))
+    conn.execute(
+        "UPDATE users SET twitter_id = ?, twitter_username = ? WHERE telegram_id = ?",
+        (twitter_id, twitter_username, telegram_id)
+    )
+    conn.commit()
+    conn.close()
+
+    # Notify user in Telegram
+    if _bot_app:
+        async def notify():
+            await _bot_app.bot.send_message(
+                chat_id=telegram_id,
+                text=f"✅ Twitter connected!\n\n🐦 @{twitter_username}\n\nYou're all set to raid!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        asyncio.run_coroutine_threadsafe(notify(), _bot_app.bot._request._client._loop if hasattr(_bot_app.bot._request, '_client') else asyncio.get_event_loop())
+
+    return f"""
+    <html><body style="font-family:monospace;background:#0d0d0d;color:#00ff88;text-align:center;padding-top:80px;">
+    <h1>✅ Connected!</h1>
+    <p style="color:#aaa;font-size:18px;">Twitter account <strong>@{twitter_username}</strong> linked.</p>
+    <p style="color:#555;margin-top:40px;">Return to Telegram — you're ready to raid.</p>
+    </body></html>
+    """
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+# ====================== BOT COMMANDS ======================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -122,6 +285,82 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 **🌎 Everyone**
 `/profile` `/connect <wallet>` `/login` `/logout`
 """, parse_mode=ParseMode.MARKDOWN)
+
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    conn = get_db()
+    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user.id,))
+    conn.commit()
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE telegram_id = ?", (user.id,))
+    row = c.fetchone()
+    conn.close()
+
+    tg_id, tw_id, tw_user, wallet, xp, disq, is_pro, joined = row
+
+    twitter_line = f"🐦 @{tw_user}" if tw_user else "❗️ No Twitter connected"
+    wallet_line = f"💼 `{wallet[:6]}...{wallet[-4:]}`" if wallet else "❗️ No Solana wallet set"
+    status = "⛔ Disqualified" if disq else ("⭐ Pro" if is_pro else "✅ Active")
+
+    text = (
+        f"👤 **Your Profile**\n\n"
+        f"Welcome back, {user.first_name}!\n\n"
+        f"{'—' * 20}\n\n"
+        f"{twitter_line}\n"
+        f"{wallet_line}\n\n"
+        f"💎 XP: `{xp}`\n"
+        f"Status: {status}"
+    )
+
+    # Build buttons
+    buttons = []
+    if not tw_user:
+        oauth_url = f"{CALLBACK_URL.rsplit('/callback', 1)[0]}/connect/{tg_id}"
+        buttons.append([InlineKeyboardButton("🐦 Connect Twitter", url=oauth_url)])
+    else:
+        buttons.append([InlineKeyboardButton("🔄 Reconnect Twitter", url=f"{CALLBACK_URL.rsplit('/callback', 1)[0]}/connect/{tg_id}")])
+
+    if not wallet:
+        buttons.append([InlineKeyboardButton("💼 Connect Wallet", callback_data="wallet_connect")])
+    else:
+        buttons.append([InlineKeyboardButton("🔄 Change Wallet", callback_data="wallet_connect")])
+
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: `/connect <wallet_address>`", parse_mode=ParseMode.MARKDOWN)
+        return
+    wallet = context.args[0]
+    conn = get_db()
+    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (update.effective_user.id,))
+    conn.execute("UPDATE users SET wallet_address = ? WHERE telegram_id = ?", (wallet, update.effective_user.id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(
+        f"✅ Wallet connected: `{wallet[:6]}...{wallet[-4:]}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Use /profile and tap **Connect Twitter** to link your account via OAuth.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET twitter_id = NULL, twitter_username = NULL WHERE telegram_id = ?",
+        (update.effective_user.id,)
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("👋 Twitter account unlinked.")
 
 async def raid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -169,11 +408,11 @@ async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (link, targets, count + 1, update.effective_user.id)
     )
     conn.commit()
-    c.execute("SELECT id, tweet_link, targets, position FROM raid_queue ORDER BY position")
+    c.execute("SELECT tweet_link, targets FROM raid_queue ORDER BY position")
     rows = c.fetchall()
     conn.close()
-    queue_text = "\n".join([f"{i+1}. {r[1]}{' — ' + r[2] if r[2] else ''}" for i, r in enumerate(rows)])
-    await update.message.reply_text(f"➕ Added to queue!\n\n**Queue:**\n{queue_text}", parse_mode=ParseMode.MARKDOWN)
+    queue_text = "\n".join([f"{i+1}. {r[0]}{' — ' + r[1] if r[1] else ''}" for i, r in enumerate(rows)])
+    await update.message.reply_text(f"➕ Added!\n\n**Queue:**\n{queue_text}", parse_mode=ParseMode.MARKDOWN)
 
 async def delnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -192,13 +431,13 @@ async def delnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT id FROM raid_queue ORDER BY position LIMIT 1 OFFSET ?", (idx - 1,))
     row = c.fetchone()
     if not row:
-        await update.message.reply_text("❌ No item at that index.")
         conn.close()
+        await update.message.reply_text("❌ No item at that index.")
         return
     conn.execute("DELETE FROM raid_queue WHERE id = ?", (row[0],))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"🗑 Removed item #{idx} from queue.")
+    await update.message.reply_text(f"🗑 Removed #{idx}.")
 
 async def setnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -217,7 +456,7 @@ async def setnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"📌 Queue reset. Next raid: {link}")
+    await update.message.reply_text(f"📌 Queue reset. Next: {link}")
 
 async def switchnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -236,8 +475,8 @@ async def switchnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("SELECT id, position FROM raid_queue ORDER BY position")
     rows = c.fetchall()
     if i1 < 1 or i2 < 1 or i1 > len(rows) or i2 > len(rows):
-        await update.message.reply_text("❌ Index out of range.")
         conn.close()
+        await update.message.reply_text("❌ Index out of range.")
         return
     id1, pos1 = rows[i1 - 1]
     id2, pos2 = rows[i2 - 1]
@@ -245,7 +484,7 @@ async def switchnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute("UPDATE raid_queue SET position = ? WHERE id = ?", (pos1, id2))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"🔄 Swapped positions #{i1} and #{i2}.")
+    await update.message.reply_text(f"🔄 Swapped #{i1} and #{i2}.")
 
 async def clearnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -259,19 +498,11 @@ async def clearnext_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def lb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     period = context.args[0].upper() if context.args else "ALL"
+    labels = {"1D": "Last 24h", "7D": "Last 7 Days", "30D": "Last 30 Days"}
+    label = labels.get(period, "All Time")
     conn = get_db()
     c = conn.cursor()
-    if period == "1D":
-        label = "Last 24h"
-    elif period == "7D":
-        label = "Last 7 Days"
-    elif period == "30D":
-        label = "Last 30 Days"
-    else:
-        label = "All Time"
-    c.execute(
-        "SELECT telegram_id, twitter_username, xp FROM users WHERE disqualified = 0 ORDER BY xp DESC LIMIT 10"
-    )
+    c.execute("SELECT telegram_id, twitter_username, xp FROM users WHERE disqualified = 0 ORDER BY xp DESC LIMIT 10")
     rows = c.fetchall()
     conn.close()
     if not rows:
@@ -293,13 +524,10 @@ async def xp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text("❌ User not found.")
         return
-    tg_id, tw, wallet, xp, disq, is_pro, joined = row
-    name = f"@{tw}" if tw else f"#{tg_id}"
+    tg_id, tw_id, tw_user, wallet, xp, disq, is_pro, joined = row
+    name = f"@{tw_user}" if tw_user else f"#{tg_id}"
     status = "⛔ Disqualified" if disq else ("⭐ Pro" if is_pro else "✅ Active")
-    await update.message.reply_text(
-        f"👤 **{name}**\n💎 XP: `{xp}`\n{status}",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"👤 **{name}**\n💎 XP: `{xp}`\n{status}", parse_mode=ParseMode.MARKDOWN)
 
 async def givexp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -316,13 +544,13 @@ async def givexp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
-        await update.message.reply_text("❌ User not found.")
         conn.close()
+        await update.message.reply_text("❌ User not found.")
         return
     conn.execute("UPDATE users SET xp = xp + ? WHERE telegram_id = ?", (amount, row[0]))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Gave `{amount}` XP to user.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ Gave `{amount}` XP.", parse_mode=ParseMode.MARKDOWN)
 
 async def remxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -339,13 +567,13 @@ async def remxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
-        await update.message.reply_text("❌ User not found.")
         conn.close()
+        await update.message.reply_text("❌ User not found.")
         return
     conn.execute("UPDATE users SET xp = MAX(0, xp - ?) WHERE telegram_id = ?", (amount, row[0]))
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Removed `{amount}` XP from user.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"✅ Removed `{amount}` XP.", parse_mode=ParseMode.MARKDOWN)
 
 async def disqualify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -357,8 +585,8 @@ async def disqualify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
-        await update.message.reply_text("❌ User not found.")
         conn.close()
+        await update.message.reply_text("❌ User not found.")
         return
     conn.execute("UPDATE users SET disqualified = 1 WHERE telegram_id = ?", (row[0],))
     conn.commit()
@@ -375,8 +603,8 @@ async def undisqualify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     row = get_user_by_identifier(conn, context.args[0])
     if not row:
-        await update.message.reply_text("❌ User not found.")
         conn.close()
+        await update.message.reply_text("❌ User not found.")
         return
     conn.execute("UPDATE users SET disqualified = 0 WHERE telegram_id = ?", (row[0],))
     conn.commit()
@@ -395,9 +623,7 @@ async def disqualified_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("✅ No disqualified users.")
         return
-    lines = ["⛔ **Disqualified Users:**\n"]
-    for tg_id, tw in rows:
-        lines.append(f"• {'@' + tw if tw else '#' + str(tg_id)}")
+    lines = ["⛔ **Disqualified Users:**\n"] + [f"• {'@' + tw if tw else '#' + str(tid)}" for tid, tw in rows]
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def lbreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,7 +634,7 @@ async def lbreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.execute("UPDATE users SET xp = 0")
     conn.commit()
     conn.close()
-    await update.message.reply_text("🔄 Leaderboard reset. All XP cleared.")
+    await update.message.reply_text("🔄 Leaderboard reset.")
 
 async def reward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -417,16 +643,15 @@ async def reward_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
         await update.message.reply_text("Usage: `/reward <user> <amount> <symbol>`", parse_mode=ParseMode.MARKDOWN)
         return
-    identifier, amount, symbol = context.args[0], context.args[1], context.args[2]
     conn = get_db()
-    row = get_user_by_identifier(conn, identifier)
+    row = get_user_by_identifier(conn, context.args[0])
     conn.close()
     if not row:
         await update.message.reply_text("❌ User not found.")
         return
-    name = f"@{row[1]}" if row[1] else f"#{row[0]}"
+    name = f"@{row[2]}" if row[2] else f"#{row[0]}"
     await update.message.reply_text(
-        f"🎁 **Reward Sent!**\n👤 {name}\n💰 `{amount} {symbol}`",
+        f"🎁 **Reward Sent!**\n👤 {name}\n💰 `{context.args[1]} {context.args[2]}`",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -439,64 +664,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🧹 Clear Queue", callback_data="settings_clearqueue")],
         [InlineKeyboardButton("🔄 Reset LB", callback_data="settings_resetlb")],
     ]
-    await update.message.reply_text(
-        "⚙️ **Settings**",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conn = get_db()
-    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user.id,))
-    conn.commit()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE telegram_id = ?", (user.id,))
-    row = c.fetchone()
-    conn.close()
-    tg_id, tw, wallet, xp, disq, is_pro, joined = row
-    wallet_display = f"`{wallet[:6]}...{wallet[-4:]}`" if wallet else "—"
-    lines = [
-        "👤 **Profile**",
-        f"🆔 Telegram: `{tg_id}`",
-        f"🐦 Twitter: {'@' + tw if tw else '—'}",
-        f"💼 Wallet: {wallet_display}",
-        f"💎 XP: `{xp}`",
-        f"⭐ Pro: {'Yes' if is_pro else 'No'}",
-        f"⛔ Disqualified: {'Yes' if disq else 'No'}",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/connect <wallet_address>`", parse_mode=ParseMode.MARKDOWN)
-        return
-    wallet = context.args[0]
-    conn = get_db()
-    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (update.effective_user.id,))
-    conn.execute("UPDATE users SET wallet_address = ? WHERE telegram_id = ?", (wallet, update.effective_user.id))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ Wallet connected: `{wallet[:6]}...{wallet[-4:]}`", parse_mode=ParseMode.MARKDOWN)
-
-async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: `/login <twitter_username>`", parse_mode=ParseMode.MARKDOWN)
-        return
-    tw = context.args[0].lstrip('@')
-    conn = get_db()
-    conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (update.effective_user.id,))
-    conn.execute("UPDATE users SET twitter_username = ? WHERE telegram_id = ?", (tw, update.effective_user.id))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ Linked Twitter: `@{tw}`", parse_mode=ParseMode.MARKDOWN)
-
-async def logout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db()
-    conn.execute("UPDATE users SET twitter_username = NULL WHERE telegram_id = ?", (update.effective_user.id,))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("👋 Twitter account unlinked.")
+    await update.message.reply_text("⚙️ **Settings**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 async def gxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
@@ -510,25 +678,33 @@ async def gxp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def trend_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📈 **Trend Boost**\n\nBoost your group's visibility by raiding consistently!\n\nKeep raiding to climb the ranks. 🚀",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text("📈 **Trend Boost**\n\nKeep raiding to climb the ranks! 🚀", parse_mode=ParseMode.MARKDOWN)
 
 async def pro_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("⭐ Upgrade to Pro", callback_data="pro_upgrade")]]
     await update.message.reply_text(
-        "⭐ **Raidar Pro**\n\nUnlock advanced features:\n• Priority queue\n• XP multipliers\n• Custom rewards\n\nContact admin to upgrade.",
+        "⭐ **Raidar Pro**\n\n• Priority queue\n• XP multipliers\n• Custom rewards\n\nContact admin to upgrade.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
+
+# ── WALLET CONNECT FLOW ───────────────────────────────
+# Tracks users awaiting wallet input
+_awaiting_wallet = set()
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "settings_stats":
+    if data == "wallet_connect":
+        _awaiting_wallet.add(query.from_user.id)
+        await query.message.reply_text(
+            "💼 Send your Solana wallet address now:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif data == "settings_stats":
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM users")
@@ -563,11 +739,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "pro_upgrade":
         await query.answer("Contact an admin to upgrade to Pro!", show_alert=True)
 
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in _awaiting_wallet:
+        _awaiting_wallet.discard(user_id)
+        wallet = update.message.text.strip()
+        # Basic Solana address validation (32-44 base58 chars)
+        if len(wallet) < 32 or len(wallet) > 44 or ' ' in wallet:
+            await update.message.reply_text("❌ That doesn't look like a valid Solana address. Try again with `/connect <address>`.", parse_mode=ParseMode.MARKDOWN)
+            return
+        conn = get_db()
+        conn.execute("INSERT OR IGNORE INTO users (telegram_id) VALUES (?)", (user_id,))
+        conn.execute("UPDATE users SET wallet_address = ? WHERE telegram_id = ?", (wallet, user_id))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(
+            f"✅ Wallet saved!\n`{wallet[:6]}...{wallet[-4:]}`\n\nUse /profile to view your profile.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
 # ====================== MAIN ======================
-# PTB manages its own event loop — do NOT use asyncio.run() or async def main()
 
 def main():
+    global _bot_app
+
+    # Start Flask in background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"🌐 OAuth server running on port {PORT}")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    _bot_app = app
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -597,9 +799,10 @@ def main():
     app.add_handler(CommandHandler("trend", trend_cmd))
     app.add_handler(CommandHandler("pro", pro_cmd))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     logger.info("🚀 Raidar Bot is running!")
-    app.run_polling()  # PTB owns the event loop — do NOT await this
+    app.run_polling()
 
 if __name__ == '__main__':
-    main()  # plain call, NOT asyncio.run()
+    main()
