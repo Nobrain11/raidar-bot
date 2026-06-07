@@ -24,7 +24,7 @@ ADMIN_IDS = [7761011341]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TWITTER_CLIENT_ID = os.getenv("TWITTER_CLIENT_ID")
 TWITTER_CLIENT_SECRET = os.getenv("TWITTER_CLIENT_SECRET")
-CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:5000/callback").strip()
+CALLBACK_URL = os.getenv("CALLBACK_URL", "http://localhost:8080/callback").strip()
 FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_hex(32))
 PORT = int(os.getenv("PORT", 8080))
 
@@ -145,7 +145,6 @@ def get_twitter_user(access_token):
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
-# Global bot reference and event loop
 _bot_app = None
 _bot_loop = None
 
@@ -222,7 +221,6 @@ def oauth_callback():
     conn.commit()
     conn.close()
 
-    # Notify user in Telegram using the bot's event loop
     if _bot_app and _bot_loop:
         async def notify():
             try:
@@ -233,7 +231,6 @@ def oauth_callback():
                 )
             except Exception as e:
                 logger.error(f"Failed to notify user {telegram_id}: {e}")
-
         asyncio.run_coroutine_threadsafe(notify(), _bot_loop)
 
     return f"""
@@ -322,7 +319,6 @@ async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: {status}"
     )
 
-    # Build connect URL from base of CALLBACK_URL
     base_url = CALLBACK_URL.rsplit('/callback', 1)[0]
     buttons = []
     if not tw_user:
@@ -708,10 +704,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "wallet_connect":
         _awaiting_wallet.add(query.from_user.id)
-        await query.message.reply_text(
-            "💼 Send your Solana wallet address now:",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await query.message.reply_text("💼 Send your Solana wallet address now:")
 
     elif data == "settings_stats":
         conn = get_db()
@@ -815,16 +808,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(error_handler)
 
-    # Start Flask in a background thread
+    # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Capture the event loop AFTER starting polling so notify() works
-    async def post_init(application):
-        global _bot_loop
-        _bot_loop = asyncio.get_event_loop()
-
-    app.post_init = post_init
+    # Store event loop for OAuth callback notifications
+    _bot_loop = asyncio.get_event_loop()
 
     logger.info("🚀 Starting Raidar Bot (polling)...")
     app.run_polling(drop_pending_updates=True)
